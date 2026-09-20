@@ -69,11 +69,12 @@ struct Cli {
 	/// Stop lowering the threshold once this many hits are found.
 	#[arg(long, default_value_t = 1)]
 	min_hits:        usize,
-	/// Preferred API provider (default: `OpenRouter` when its key exists). Fails
-	/// over if both keys exist.
+	/// Preferred API provider. Default `classifier` (free, no key);
+	/// OpenRouter/TypeSafe are failovers when their keys exist, and pinning
+	/// one restricts the chain to that pair.
 	#[arg(long, value_enum)]
 	endpoint:        Option<jev::Endpoint>,
-	/// Jev model id or alias.
+	/// Jev model id or alias (ignored by the classifier.dev provider).
 	#[arg(long, default_value = "jev-latest")]
 	model:           String,
 	/// Extra grep keywords for grep-prior strategies (comma-separated; default:

@@ -42,10 +42,12 @@ Natural-language search that works like `grep`. No embeddings, no index, no daem
    cargo build --release
    ```
 
-2. **Setup (Recommended)**
+2. **Setup**
 
-   jegrep judges code with [Jev](https://docs.typesafe.ai) via OpenRouter or TypeSafe directly.
-   Set at least one key, in the process environment or `~/.env`:
+   jegrep judges code with [Jev](https://docs.typesafe.ai). By default it uses
+   [classifier.dev](https://classifier.dev) — free, no API key, no account — so
+   this step is optional. OpenRouter and TypeSafe are used as failover when
+   their keys exist:
 
    ```bash
    export OPENROUTER_API_KEY=...
@@ -53,11 +55,14 @@ Natural-language search that works like `grep`. No embeddings, no index, no daem
    export TYPESAFE_API_KEY=...
    ```
 
-   By default OpenRouter is preferred when its key exists, otherwise TypeSafe is used.
-   Pin one with `--endpoint openrouter` / `--endpoint typesafe`. With both keys set,
-   auth/credit failures (401/402/403), timeouts (408), rate limits (429), server
-   errors (5xx), transport failures, and invalid responses automatically fail over
-   to the other provider. Other request errors (e.g. 400/422) are returned as-is.
+   By default classifier.dev is tried first; when a key exists, OpenRouter or
+   TypeSafe answers if classifier.dev fails (auth/credit failures (401/402/403),
+   timeouts (408), rate limits (429), server errors (5xx), transport failures,
+   and invalid responses). Pin a provider with `--endpoint classifier`,
+   `--endpoint openrouter`, or `--endpoint typesafe`; a pinned OpenRouter/TypeSafe
+   pair is used exclusively (classifier.dev is dropped from the chain). Other
+   request errors (e.g. 400/422) are returned as-is. classifier.dev is free, so
+   token/cost figures read zero while it serves the requests.
 
 3. **Search**
 
@@ -96,8 +101,8 @@ jegrep "how is the database connection pooled?"
 | `--ranges <n>` | Heatmap line ranges per file | `16` |
 | `--min-hits <n>` | Stop lowering thresholds once this many hits exist | `1` |
 | `-k`, `--keywords <list>` | Extra grep keywords for grep-prior strategies | derived |
-| `--endpoint <provider>` | `openrouter` \| `typesafe` (automatic by default) | auto |
-| `--model <id>` | Jev model id or alias | `jev-latest` |
+| `--endpoint <provider>` | `classifier` \| `openrouter` \| `typesafe` (classifier by default) | `classifier` |
+| `--model <id>` | Jev model id or alias (ignored by classifier.dev) | `jev-latest` |
 | `--hidden` | Include dot-files and dot-folders | `false` |
 | `--tree` | Print the annotated exploration tree | `false` |
 | `--json` | JSON output format | `false` |
@@ -147,7 +152,7 @@ There is no config file. Everything is CLI flags plus environment variables.
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `OPENROUTER_API_KEY` / `TYPESAFE_API_KEY` | Provider keys (env or `~/.env`) | unset |
+| `OPENROUTER_API_KEY` / `TYPESAFE_API_KEY` | Optional failover provider keys (env or `~/.env`) | unset |
 | `JEGREP_CASCADE_CANDIDATES` / `FILES` / `WINDOWS` / `BYTES` | Cascade candidate/file/passage/byte budgets | `128` / `20` / `24` / `8192` |
 | `JEGREP_CASCADE_SKETCH_BYTES` / `FULL_LIMIT` / `CUTOFF` | Sketch size, full-passage cap, sketch cutoff | `384` / `40` / `0.45` |
 | `JEGREP_WINDOW_CANDIDATES` / `FILES` / `PER_FILE` / `BYTES` / `PACK` | Window strategy budgets | — |
@@ -165,8 +170,9 @@ are excluded unless `--hidden` is passed.
 - **Nothing found?** Thresholds lower automatically across rounds and cached
   judgments reopen — but you can also pass an explicit `-t 0.3,0.1`.
 - **Weird results?** Re-run with `--verbose` and `--tree` to see every judgment.
-- **Auth errors?** Check the right key is set (`OPENROUTER_API_KEY` /
-  `TYPESAFE_API_KEY`) or pin `--endpoint` to the provider you meant.
+- **Auth errors?** classifier.dev needs no key. If you pinned a keyed provider
+  (`--endpoint openrouter` / `--endpoint typesafe`), check that key is set
+  (`OPENROUTER_API_KEY` / `TYPESAFE_API_KEY`).
 - **Slow or pricey?** Lower `-n`/`--max-batch`, raise `-t`, or try `-s beam`/`budget`.
 
 ## Building from Source

@@ -1,9 +1,10 @@
 //! Minimal Jev (`TypeSafe` System One) HTTP client over ureq.
 //!
-//! Two providers, one request shape: a `state` the model looks at, and a map of
-//! typed questions (noul = yes/no probability, choice = distribution over
-//! options). Answers come back under the same keys. Retries 429/529/5xx with
-//! backoff.
+//! Providers: [`classifier.dev`](https://classifier.dev) by default (no key,
+//! free), with `OpenRouter` and `TypeSafe` as failover when their keys exist.
+//! Two request shapes: a `state` the model looks at, and a map of typed
+//! questions (noul = yes/no probability, choice = distribution over options).
+//! Answers come back under the same keys. Retries 429/529/5xx with backoff.
 
 use std::{collections::BTreeMap, fmt, thread, time::Duration};
 
@@ -12,6 +13,8 @@ use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Endpoint {
+	/// classifier.dev — free zero-shot classification, no key. Default.
+	Classifier,
 	Openrouter,
 	Typesafe,
 }
@@ -19,6 +22,7 @@ pub enum Endpoint {
 impl Endpoint {
 	pub const fn key_name(self) -> &'static str {
 		match self {
+			Self::Classifier => "",
 			Self::Openrouter => "OPENROUTER_API_KEY",
 			Self::Typesafe => "TYPESAFE_API_KEY",
 		}
@@ -26,39 +30,67 @@ impl Endpoint {
 
 	const fn url(self) -> &'static str {
 		match self {
+			Self::Classifier => "https://classifier.dev/v1/classify",
 			Self::Openrouter => "https://openrouter.ai/api/alpha/decisions",
 			Self::Typesafe => "https://api.typesafe.ai/v1/systemone",
 		}
 	}
 }
 
+/// classifier.dev request caps: 20 dimensions per request, 2–100 labels per
+/// dimension, 4,000 characters of instructions per dimension with 16,000
+/// combined (kept under with margin), and a 32,000-character input.
+const MAX_DIMENSIONS: usize = 20;
+const MAX_LABELS: usize = 100;
+const MAX_INSTRUCTIONS: usize = 4_000;
+const MAX_COMBINED_INSTRUCTIONS: usize = 15_000;
+const MAX_INPUT_CHARS: usize = 32_000;
+
 struct Provider {
 	url:  String,
 	auth: String,
+	kind: Endpoint,
 }
 
-/// Load both keys independently, preserving process-env precedence for each.
+/// Load the provider chain: classifier.dev first (no key), then the keyed
+/// providers whose keys exist, in the given order. A pinned provider is
+/// required and comes first.
 fn providers(
 	preferred: Option<Endpoint>,
 	mut lookup: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<Vec<Provider>, String> {
-	let first = preferred.unwrap_or(Endpoint::Openrouter);
-	let second = match first {
-		Endpoint::Openrouter => Endpoint::Typesafe,
-		Endpoint::Typesafe => Endpoint::Openrouter,
-	};
 	let mut providers = Vec::new();
-	for endpoint in [first, second] {
-		match lookup(endpoint.key_name()) {
-			Ok(key) => {
-				providers.push(Provider { url: endpoint.url().into(), auth: format!("Bearer {key}") })
-			},
-			Err(e) if preferred == Some(endpoint) => return Err(e),
-			Err(_) => {},
-		}
+	let mut push_keyed =
+		|endpoint: Endpoint, required: bool, providers: &mut Vec<Provider>| -> Result<(), String> {
+			match lookup(endpoint.key_name()) {
+				Ok(key) => {
+					providers.push(Provider {
+						url:  endpoint.url().into(),
+						auth: format!("Bearer {key}"),
+						kind: endpoint,
+					});
+					Ok(())
+				},
+				Err(e) if required => Err(e),
+				Err(_) => Ok(()),
+			}
+		};
+	match preferred {
+		Some(Endpoint::Classifier) | None => providers.push(Provider {
+			url:  Endpoint::Classifier.url().into(),
+			auth: String::new(),
+			kind: Endpoint::Classifier,
+		}),
+		Some(endpoint) => push_keyed(endpoint, true, &mut providers)?,
 	}
-	if providers.is_empty() {
-		return Err("set OPENROUTER_API_KEY or TYPESAFE_API_KEY in the environment or ~/.env".into());
+	match preferred {
+		None => {
+			push_keyed(Endpoint::Openrouter, false, &mut providers)?;
+			push_keyed(Endpoint::Typesafe, false, &mut providers)?;
+		},
+		Some(Endpoint::Openrouter) => push_keyed(Endpoint::Typesafe, false, &mut providers)?,
+		Some(Endpoint::Typesafe) => push_keyed(Endpoint::Openrouter, false, &mut providers)?,
+		Some(Endpoint::Classifier) => {},
 	}
 	Ok(providers)
 }
@@ -115,7 +147,7 @@ pub enum Answer {
 	Score { score: f64 },
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct Response {
 	pub model:   String,
 	pub answers: BTreeMap<String, Answer>,
@@ -210,87 +242,51 @@ impl Client {
 		})
 	}
 
+	/// Judge one state against a batch of questions. Provider dispatch and
+	/// question chunking happen per attempt, so a failover may switch both.
 	pub fn system_one(
-		&self,
-		state: &Value,
-		questions: &BTreeMap<String, Question>,
-	) -> Result<Response, Error> {
-		let Some(chunk_size) = self.question_chunk.filter(|n| questions.len() > *n) else {
-			return self.system_one_request(state, questions);
-		};
-		// Choice probabilities depend on the complete option set. Leave mixed
-		// batches together too, rather than assuming independence across types.
-		if !questions
-			.values()
-			.all(|q| matches!(q, Question::Noul { .. }))
-		{
-			return self.system_one_request(state, questions);
-		}
-		let entries: Vec<_> = questions.iter().collect();
-		let chunks: Vec<BTreeMap<String, Question>> = entries
-			.chunks(chunk_size)
-			.map(|chunk| {
-				chunk
-					.iter()
-					.map(|(key, question)| ((*key).clone(), (*question).clone()))
-					.collect()
-			})
-			.collect();
-		let mut merged =
-			Response { model: String::new(), answers: BTreeMap::new(), usage: Usage::default() };
-		// Scoped waves keep fan-out bounded independently of batch size, and
-		// wait for already-started siblings before returning any failure.
-		for wave in chunks.chunks(2) {
-			let responses = thread::scope(|scope| {
-				let workers: Vec<_> = wave
-					.iter()
-					.map(|chunk| scope.spawn(move || self.system_one_request(state, chunk)))
-					.collect();
-				workers
-					.into_iter()
-					.map(|worker| worker.join().expect("question chunk worker panicked"))
-					.collect::<Vec<_>>()
-			});
-			for response in responses {
-				let response = response?;
-				if merged.model.is_empty() {
-					merged.model = response.model;
-				}
-				merged.usage.input_tokens += response.usage.input_tokens;
-				merged.usage.output_tokens += response.usage.output_tokens;
-				for (key, answer) in response.answers {
-					if merged.answers.insert(key.clone(), answer).is_some() {
-						return Err(Error::Decode(format!(
-							"duplicate answer key across question chunks: {key}"
-						)));
-					}
-				}
-			}
-		}
-		Ok(merged)
-	}
-
-	fn system_one_request(
 		&self,
 		state: &Value,
 		questions: &BTreeMap<String, Question>,
 	) -> Result<Response, Error> {
 		use std::sync::atomic::Ordering;
 		let first = self.active.load(Ordering::Relaxed);
-		let has_fallback = self.providers.len() > 1;
-		let result = self.send(first, state, questions, !has_fallback);
-		match result {
-			Err(ref error) if has_fallback && error.can_failover() => {
-				let fallback = 1 - first;
-				RETRIES.fetch_add(1, Ordering::Relaxed);
-				let result = self.send(fallback, state, questions, true);
-				if result.is_ok() {
-					self.active.store(fallback, Ordering::Relaxed);
-				}
-				result
-			},
-			result => result,
+		let mut order: Vec<usize> = (0..self.providers.len())
+			.map(|i| (first + i) % self.providers.len())
+			.collect();
+		// classifier.dev caps a dimension at 100 labels; a bigger Choice needs
+		// a keyed provider that accepts up to 255 options.
+		if questions
+			.values()
+			.any(|q| matches!(q, Question::Choice { criteria, .. } if criteria.len() > MAX_LABELS))
+		{
+			if order
+				.iter()
+				.all(|&i| self.providers[i].kind == Endpoint::Classifier)
+			{
+				return Err(Error::Status(
+					400,
+					"a choice with more than 100 options requires OPENROUTER_API_KEY or \
+					 TYPESAFE_API_KEY (classifier.dev caps a dimension at 100 labels)"
+						.into(),
+				));
+			}
+			order.sort_by_key(|&i| self.providers[i].kind == Endpoint::Classifier);
 		}
+		let mut result = self.send(order[0], state, questions, order.len() == 1);
+		for &fallback in &order[1..] {
+			match &result {
+				Err(error) if error.can_failover() => {
+					RETRIES.fetch_add(1, Ordering::Relaxed);
+					result = self.send(fallback, state, questions, true);
+					if result.is_ok() {
+						self.active.store(fallback, Ordering::Relaxed);
+					}
+				},
+				_ => break,
+			}
+		}
+		result
 	}
 
 	fn send(
@@ -301,44 +297,125 @@ impl Client {
 		retry: bool,
 	) -> Result<Response, Error> {
 		let provider = &self.providers[provider];
-		let body = RequestBody { state, model: &self.model, questions };
-		if std::env::var_os("JEGREP_DUMP").is_some()
-			&& let Ok(text) = serde_json::to_string_pretty(&body)
-		{
-			let shown: String = text.chars().take(6000).collect();
-			crate::ui::diagnostic(&format!(
-				"──── request ({} bytes) ────\n{shown}{}\n────",
-				text.len(),
-				if text.len() > 6000 { "\n…" } else { "" }
-			));
+		match provider.kind {
+			Endpoint::Classifier => self.classify(provider, state, questions, retry),
+			_ => self.system_one_keyed(provider, state, questions, retry),
 		}
+	}
+
+	/// The keyed System One request shape, optionally split into independent
+	/// Noul chunks by `JEGREP_QUESTION_CHUNK`.
+	fn system_one_keyed(
+		&self,
+		provider: &Provider,
+		state: &Value,
+		questions: &BTreeMap<String, Question>,
+		retry: bool,
+	) -> Result<Response, Error> {
+		let chunks: Vec<BTreeMap<String, Question>> =
+			match self.question_chunk.filter(|n| questions.len() > *n) {
+				// Choice probabilities depend on the complete option set. Leave
+				// mixed batches together too, rather than assuming independence
+				// across types.
+				Some(chunk_size)
+					if questions
+						.values()
+						.all(|q| matches!(q, Question::Noul { .. })) =>
+				{
+					questions
+						.iter()
+						.map(|(key, question)| ((*key).clone(), (*question).clone()))
+						.collect::<Vec<_>>()
+						.chunks(chunk_size)
+						.map(|chunk| chunk.iter().cloned().collect())
+						.collect()
+				},
+				_ => vec![questions.clone()],
+			};
+		merge_chunks(&chunks, |chunk| {
+			let body = RequestBody { state, model: &self.model, questions: chunk };
+			if std::env::var_os("JEGREP_DUMP").is_some()
+				&& let Ok(text) = serde_json::to_string_pretty(&body)
+			{
+				let shown: String = text.chars().take(6000).collect();
+				crate::ui::diagnostic(&format!(
+					"──── request ({} bytes) ────\n{shown}{}\n────",
+					text.len(),
+					if text.len() > 6000 { "\n…" } else { "" }
+				));
+			}
+			let (status, text) = self.post(provider, &serde_json::to_value(&body).unwrap(), retry)?;
+			if status != 200 {
+				return Err(Error::Status(status, truncate(&text, 300)));
+			}
+			serde_json::from_str(&text).map_err(|e| Error::Decode(e.to_string()))
+		})
+	}
+
+	/// classifier.dev: the shared state becomes the single input text and every
+	/// question becomes an independent dimension. Free and keyless, so usage
+	/// stays at zero tokens.
+	fn classify(
+		&self,
+		provider: &Provider,
+		state: &Value,
+		questions: &BTreeMap<String, Question>,
+		retry: bool,
+	) -> Result<Response, Error> {
+		let input = state_text(state);
+		let chunks = dimension_chunks(questions);
+		merge_chunks(&chunks, |chunk| {
+			let dimensions: BTreeMap<&str, Value> = chunk
+				.iter()
+				.map(|(key, question)| {
+					(
+						key.as_str(),
+						serde_json::json!({
+							"labels": labels_of(question),
+							"instructions": question_text(question),
+						}),
+					)
+				})
+				.collect();
+			let body =
+				serde_json::json!({ "items": [input], "tier": "fast", "dimensions": dimensions });
+			if let Ok(text) = serde_json::to_string_pretty(&body)
+				&& std::env::var_os("JEGREP_DUMP").is_some()
+			{
+				let shown: String = text.chars().take(6000).collect();
+				crate::ui::diagnostic(&format!(
+					"──── request ({} bytes) ────\n{shown}{}\n────",
+					text.len(),
+					if text.len() > 6000 { "\n…" } else { "" }
+				));
+			}
+			let (status, text) = self.post(provider, &body, retry)?;
+			if status != 200 {
+				return Err(Error::Status(status, truncate(&text, 300)));
+			}
+			let parsed: ClassifierResponse =
+				serde_json::from_str(&text).map_err(|e| Error::Decode(e.to_string()))?;
+			parsed.into_response(chunk)
+		})
+	}
+
+	/// One physical HTTP POST with retry/backoff. Returns the status and body
+	/// for the caller to interpret; transport failures that are not clearly
+	/// permanent are retried here.
+	fn post(&self, provider: &Provider, body: &Value, retry: bool) -> Result<(u16, String), Error> {
+		use std::sync::atomic::Ordering;
 		let mut attempt = 0u32;
 		loop {
-			HTTP_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			let sent = self
+			HTTP_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+			match self
 				.agent
 				.post(&provider.url)
 				.header("Authorization", &provider.auth)
 				.header("Content-Type", "application/json")
-				.send_json(&body);
-			match sent {
+				.send_json(body)
+			{
 				Ok(mut resp) => {
 					let status = resp.status().as_u16();
-					if status == 200 {
-						let parsed = resp
-							.body_mut()
-							.read_json::<Response>()
-							.map_err(|e| Error::Decode(e.to_string()));
-						if let (Ok(r), Some(_)) = (&parsed, std::env::var_os("JEGREP_DUMP")) {
-							crate::ui::diagnostic(&format!(
-								"──── usage: {} questions → {} input tokens ({} per question) ────",
-								questions.len(),
-								r.usage.input_tokens,
-								r.usage.input_tokens / questions.len().max(1) as u64
-							));
-						}
-						return parsed;
-					}
 					let retry_after = resp
 						.headers()
 						.get("retry-after")
@@ -348,8 +425,8 @@ impl Client {
 					let transient = status == 429 || status == 529 || (500..600).contains(&status);
 					if retry && transient && attempt < self.max_retries {
 						attempt += 1;
-						RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-						if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+						RETRIES.fetch_add(1, Ordering::Relaxed);
+						if !WARNED.swap(true, Ordering::Relaxed) {
 							crate::ui::diagnostic(&format!(
 								"  ! jev: HTTP {status}, backing off (further retries are counted \
 								 silently; see footer)"
@@ -358,14 +435,14 @@ impl Client {
 						thread::sleep(backoff(attempt, retry_after));
 						continue;
 					}
-					return Err(Error::Status(status, truncate(&text, 300)));
+					return Ok((status, text));
 				},
 				Err(e) => {
 					let transient =
 						!matches!(e, ureq::Error::BadUri(_) | ureq::Error::Http(_) | ureq::Error::Tls(_));
 					if retry && transient && attempt < self.max_retries {
 						attempt += 1;
-						RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+						RETRIES.fetch_add(1, Ordering::Relaxed);
 						thread::sleep(backoff(attempt, None));
 						continue;
 					}
@@ -373,6 +450,188 @@ impl Client {
 				},
 			}
 		}
+	}
+}
+
+// ── classifier.dev translation ──────────────────────────────────────────────
+
+/// Split questions into independent requests and merge the answers. Chunks
+/// run in waves of two so fan-out stays bounded; a failed chunk aborts the
+/// remaining waves.
+fn merge_chunks(
+	chunks: &[BTreeMap<String, Question>],
+	request: impl Fn(&BTreeMap<String, Question>) -> Result<Response, Error> + Sync,
+) -> Result<Response, Error> {
+	let mut merged = Response::default();
+	for wave in chunks.chunks(2) {
+		let responses = thread::scope(|scope| {
+			wave
+				.iter()
+				.map(|chunk| scope.spawn(|| request(chunk)))
+				.collect::<Vec<_>>()
+				.into_iter()
+				.map(|worker| worker.join().expect("question chunk worker panicked"))
+				.collect::<Vec<_>>()
+		});
+		for response in responses {
+			let response = response?;
+			if merged.model.is_empty() {
+				merged.model = response.model;
+			}
+			merged.usage.input_tokens += response.usage.input_tokens;
+			merged.usage.output_tokens += response.usage.output_tokens;
+			for (key, answer) in response.answers {
+				if merged.answers.insert(key.clone(), answer).is_some() {
+					return Err(Error::Decode(format!(
+						"duplicate answer key across question chunks: {key}"
+					)));
+				}
+			}
+		}
+	}
+	Ok(merged)
+}
+
+/// The serialized state is the model-facing input, capped at the API limit.
+fn state_text(state: &Value) -> String {
+	let text = serde_json::to_string(state).unwrap_or_default();
+	if text.chars().count() > MAX_INPUT_CHARS {
+		text.chars().take(MAX_INPUT_CHARS).collect()
+	} else {
+		text
+	}
+}
+
+/// Noul questions classify over yes/no; the yes share is the probability.
+fn labels_of(question: &Question) -> Vec<&str> {
+	match question {
+		Question::Noul { .. } => vec!["yes", "no"],
+		Question::Choice { criteria, .. } => criteria.keys().map(String::as_str).collect(),
+	}
+}
+
+/// Flatten a question into classifier instructions, folding the criteria in —
+/// the API only carries one instructions string per dimension.
+fn question_text(question: &Question) -> String {
+	let (instructions, detail) = match question {
+		Question::Noul { instructions, criteria } => (
+			instructions,
+			criteria
+				.as_ref()
+				.map(|c| format!("\n\n\"yes\" means: {}\n\"no\" means: {}", c.yes, c.no)),
+		),
+		Question::Choice { instructions, criteria } => {
+			let options: String = criteria
+				.iter()
+				.map(|(name, desc)| match desc {
+					Value::String(d) => format!("\n- {name}: {d}"),
+					Value::Null => format!("\n- {name}"),
+					other => format!("\n- {name}: {other}"),
+				})
+				.collect();
+			(instructions, Some(format!("\n\nOptions:{options}")))
+		},
+	};
+	let mut text = match instructions {
+		Value::String(s) => s.clone(),
+		other => other.to_string(),
+	};
+	if let Some(detail) = detail {
+		text.push_str(&detail);
+	}
+	if text.chars().count() > MAX_INSTRUCTIONS {
+		text.chars().take(MAX_INSTRUCTIONS).collect()
+	} else {
+		text
+	}
+}
+
+/// Chunk questions into classifier requests: at most 20 dimensions, and at
+/// most ~15,000 combined instruction characters (API cap 16,000).
+fn dimension_chunks(questions: &BTreeMap<String, Question>) -> Vec<BTreeMap<String, Question>> {
+	let mut chunks = Vec::new();
+	let mut current = BTreeMap::new();
+	let mut combined = 0usize;
+	for (key, question) in questions {
+		let size = question_text(question).len();
+		if !current.is_empty()
+			&& (current.len() >= MAX_DIMENSIONS || combined + size > MAX_COMBINED_INSTRUCTIONS)
+		{
+			chunks.push(std::mem::take(&mut current));
+			combined = 0;
+		}
+		combined += size;
+		current.insert(key.clone(), question.clone());
+	}
+	if !current.is_empty() {
+		chunks.push(current);
+	}
+	chunks
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct ClassifierResponse {
+	model:   String,
+	results: Vec<ClassifierResult>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ClassifierResult {
+	dimensions: BTreeMap<String, ClassifierAnswer>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ClassifierAnswer {
+	#[serde(default)]
+	label:      Option<String>,
+	#[serde(default)]
+	confidence: Option<f64>,
+	#[serde(default)]
+	scores:     Option<BTreeMap<String, Option<f64>>>,
+}
+
+impl ClassifierResponse {
+	fn into_response(self, questions: &BTreeMap<String, Question>) -> Result<Response, Error> {
+		let dimensions = &self
+			.results
+			.into_iter()
+			.next()
+			.ok_or_else(|| Error::Decode("classifier response has no results".into()))?
+			.dimensions;
+		let mut answers = BTreeMap::new();
+		for (key, question) in questions {
+			let answer = dimensions
+				.get(key)
+				.ok_or_else(|| Error::Decode(format!("classifier response is missing {key}")))?;
+			answers.insert(key.clone(), match question {
+				Question::Noul { .. } => Answer::Noul {
+					noul: answer
+						.scores
+						.as_ref()
+						.and_then(|s| s.get("yes").copied().flatten())
+						.or(match answer.label.as_deref() {
+							Some("yes") => Some(1.0),
+							Some("no") => Some(0.0),
+							_ => None,
+						})
+						.unwrap_or(0.5),
+				},
+				Question::Choice { .. } => Answer::Choice {
+					choice:        answer.label.clone().unwrap_or_default(),
+					probabilities: answer
+						.scores
+						.as_ref()
+						.map(|s| {
+							s.iter()
+								.filter_map(|(k, v)| v.map(|v| (k.clone(), v)))
+								.collect()
+						})
+						.unwrap_or_default(),
+					confidence:    answer.confidence.unwrap_or(0.0),
+				},
+			});
+		}
+		Ok(Response { model: self.model, answers, usage: Usage::default() })
 	}
 }
 
@@ -407,10 +666,19 @@ mod tests {
 	fn provider_selection() {
 		let both = |name: &str| Ok(name.to_owned());
 		let auto = providers(None, both).unwrap();
-		assert_eq!(auto[0].url, Endpoint::Openrouter.url());
-		assert_eq!(auto[1].auth, "Bearer TYPESAFE_API_KEY");
+		assert_eq!(auto[0].kind, Endpoint::Classifier);
+		assert_eq!(auto[1].url, Endpoint::Openrouter.url());
+		assert_eq!(auto[1].auth, "Bearer OPENROUTER_API_KEY");
+		assert_eq!(auto[2].auth, "Bearer TYPESAFE_API_KEY");
+		// Pinned keyed providers keep their pair as failover; classifier.dev is
+		// dropped from the chain because the pin was explicit.
 		let explicit = providers(Some(Endpoint::Typesafe), both).unwrap();
-		assert_eq!(explicit[0].url, Endpoint::Typesafe.url());
+		assert_eq!(explicit[0].kind, Endpoint::Typesafe);
+		assert_eq!(explicit[1].kind, Endpoint::Openrouter);
+		let pinned = providers(Some(Endpoint::Classifier), both).unwrap();
+		assert_eq!(pinned.len(), 1);
+		assert_eq!(pinned[0].kind, Endpoint::Classifier);
+		// classifier.dev needs no key: it is always available by default.
 		let only_typesafe = |name: &str| {
 			if name == "TYPESAFE_API_KEY" {
 				Ok("direct-key".into())
@@ -418,9 +686,11 @@ mod tests {
 				Err("missing".into())
 			}
 		};
-		assert_eq!(providers(None, only_typesafe).unwrap()[0].url, Endpoint::Typesafe.url());
+		let chain = providers(None, only_typesafe).unwrap();
+		assert_eq!(chain[0].kind, Endpoint::Classifier);
+		assert_eq!(chain[1].url, Endpoint::Typesafe.url());
 		assert!(providers(Some(Endpoint::Openrouter), only_typesafe).is_err());
-		assert!(providers(None, |_| Err("missing".into())).is_err());
+		assert_eq!(providers(None, |_| Err("missing".into())).unwrap()[0].kind, Endpoint::Classifier);
 	}
 
 	fn server(status: u16, count: usize, key: &'static str) -> (String, thread::JoinHandle<()>) {
@@ -488,11 +758,10 @@ mod tests {
 				max_retries:    0,
 				question_chunk: None,
 			};
-			client.providers =
-				vec![Provider { url: primary, auth: "Bearer primary".into() }, Provider {
-					url:  fallback,
-					auth: "Bearer fallback".into(),
-				}];
+			client.providers = vec![
+				Provider { url: primary, auth: "Bearer primary".into(), kind: Endpoint::Openrouter },
+				Provider { url: fallback, auth: "Bearer fallback".into(), kind: Endpoint::Typesafe },
+			];
 			client.max_retries = 0;
 			for _ in 0..2 {
 				client.system_one(&Value::Null, &BTreeMap::new()).unwrap();
@@ -529,7 +798,11 @@ mod tests {
 				.timeout_global(Some(Duration::from_secs(5)))
 				.build()
 				.new_agent(),
-			providers: vec![Provider { url, auth: "Bearer primary".into() }],
+			providers: vec![Provider {
+				url,
+				auth: "Bearer primary".into(),
+				kind: Endpoint::Openrouter,
+			}],
 			active: std::sync::atomic::AtomicUsize::new(0),
 			model: "jev-latest".into(),
 			max_retries: 0,
@@ -698,9 +971,11 @@ mod tests {
 		let (primary, p, _) = question_server(2, |_| 401);
 		let (fallback, f, _) = question_server(3, |_| 200);
 		let mut client = chunk_client(primary, Some(1));
-		client
-			.providers
-			.push(Provider { url: fallback, auth: "Bearer fallback".into() });
+		client.providers.push(Provider {
+			url:  fallback,
+			auth: "Bearer fallback".into(),
+			kind: Endpoint::Typesafe,
+		});
 		let response = client.system_one(&Value::Null, &noul_questions(3)).unwrap();
 		assert_eq!(response.answers.len(), 3);
 		assert_eq!(response.usage.input_tokens, 330);
@@ -708,5 +983,253 @@ mod tests {
 		assert_eq!(client.active.load(Ordering::Relaxed), 1);
 		assert_eq!(p.join().unwrap().len(), 2);
 		assert_eq!(f.join().unwrap().len(), 3);
+	}
+
+	fn classifier_client(url: String) -> Client {
+		Client {
+			agent:          ureq::Agent::config_builder()
+				.http_status_as_error(false)
+				.timeout_global(Some(Duration::from_secs(5)))
+				.build()
+				.new_agent(),
+			providers:      vec![Provider { url, auth: String::new(), kind: Endpoint::Classifier }],
+			active:         std::sync::atomic::AtomicUsize::new(0),
+			model:          "jev-latest".into(),
+			max_retries:    0,
+			question_chunk: None,
+		}
+	}
+
+	/// Accepts `count` classifier requests, records the parsed JSON bodies, and
+	/// answers every dimension with fixed yes/no scores.
+	fn classifier_server(
+		count: usize,
+		status_for: fn(&Value) -> u16,
+	) -> (String, thread::JoinHandle<Vec<Value>>) {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		listener.set_nonblocking(true).unwrap();
+		let url = format!("http://{}", listener.local_addr().unwrap());
+		let handle = thread::spawn(move || {
+			let mut workers = Vec::new();
+			let deadline = std::time::Instant::now() + Duration::from_secs(5);
+			while workers.len() < count {
+				let mut stream = match listener.accept() {
+					Ok((stream, _)) => stream,
+					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+						assert!(std::time::Instant::now() < deadline, "missing mock HTTP request");
+						thread::sleep(Duration::from_millis(1));
+						continue;
+					},
+					Err(e) => panic!("mock accept: {e}"),
+				};
+				workers.push(thread::spawn(move || {
+					stream.set_nonblocking(false).unwrap();
+					stream
+						.set_read_timeout(Some(Duration::from_secs(5)))
+						.unwrap();
+					let mut bytes = Vec::new();
+					let mut buffer = [0; 4096];
+					let request: Value = loop {
+						let n = stream.read(&mut buffer).unwrap();
+						assert!(n > 0);
+						bytes.extend_from_slice(&buffer[..n]);
+						if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+							let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+							let length: usize = headers
+								.lines()
+								.find_map(|line| line.strip_prefix("content-length:"))
+								.unwrap()
+								.trim()
+								.parse()
+								.unwrap();
+							if bytes.len() >= end + 4 + length {
+								break serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+							}
+						}
+					};
+					let keys: Vec<&String> = request["dimensions"].as_object().unwrap().keys().collect();
+					let dimensions: serde_json::Map<String, Value> = keys
+						.iter()
+						.map(|key| {
+							(
+								(*key).clone(),
+								serde_json::json!({
+									"label": "yes", "confidence": 0.9,
+									"scores": {"yes": 0.9, "no": 0.1}, "ms": 1,
+								}),
+							)
+						})
+						.collect();
+					let status = status_for(&request);
+					let body = serde_json::json!({
+						"tier": "fast", "model": "jev-test",
+						"results": [{ "dimensions": dimensions }],
+						"usage": {"classifications": dimensions.len(), "ms": 1},
+					})
+					.to_string();
+					write!(
+						stream,
+						"HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: \
+						 application/json\r\nConnection: close\r\n\r\n{body}",
+						body.len()
+					)
+					.unwrap();
+					request
+				}));
+			}
+			workers
+				.into_iter()
+				.map(|worker| worker.join().unwrap())
+				.collect::<Vec<Value>>()
+		});
+		(url, handle)
+	}
+
+	#[test]
+	fn classifier_translation_folds_criteria_and_chunks_dimensions() {
+		let noul = Question::Noul {
+			instructions: Value::String("Is this relevant?".into()),
+			criteria:     Some(NoulCriteria { yes: "has it".into(), no: "lacks it".into() }),
+		};
+		let text = question_text(&noul);
+		assert!(text.starts_with("Is this relevant?"));
+		assert!(text.contains("\"yes\" means: has it"));
+		assert!(text.contains("\"no\" means: lacks it"));
+		assert_eq!(labels_of(&noul), vec!["yes", "no"]);
+
+		let choice = Question::Choice {
+			instructions: Value::String("Pick one".into()),
+			criteria:     [
+				("a".to_string(), Value::Null),
+				("b".to_string(), Value::String("bee".into())),
+			]
+			.into_iter()
+			.collect(),
+		};
+		let text = question_text(&choice);
+		assert!(text.contains("Pick one"));
+		assert!(text.contains("\n- a"));
+		assert!(text.contains("\n- b: bee"));
+		assert_eq!(labels_of(&choice), vec!["a", "b"]);
+
+		// Instructions are capped per dimension...
+		let huge = Question::Noul {
+			instructions: Value::String("x".repeat(MAX_INSTRUCTIONS + 500)),
+			criteria:     None,
+		};
+		assert_eq!(question_text(&huge).chars().count(), MAX_INSTRUCTIONS);
+		// ...and the combined instruction budget forces extra chunks: 25 × 4,000
+		// characters at a 15,000-character cap means three dimensions per chunk.
+		let questions: BTreeMap<String, Question> = (0..MAX_DIMENSIONS + 5)
+			.map(|i| (format!("q{i:02}"), huge.clone()))
+			.collect();
+		let chunks = dimension_chunks(&questions);
+		assert_eq!(chunks.len(), 9);
+		assert!(chunks.iter().all(|c| c.len() <= MAX_DIMENSIONS));
+		// The dimension cap alone splits 25 small questions 20 + 5.
+		let small: BTreeMap<String, Question> = (0..MAX_DIMENSIONS + 5)
+			.map(|i| (format!("q{i:02}"), noul.clone()))
+			.collect();
+		let chunks = dimension_chunks(&small);
+		assert_eq!(chunks.len(), 2);
+		assert_eq!(chunks[0].len(), MAX_DIMENSIONS);
+		assert_eq!(chunks[1].len(), 5);
+
+		// The serialized state is capped at the API's input limit.
+		let state = serde_json::json!({ "content": "y".repeat(MAX_INPUT_CHARS + 100) });
+		assert_eq!(state_text(&state).chars().count(), MAX_INPUT_CHARS);
+	}
+
+	#[test]
+	fn classifier_endpoint_maps_dimensions_and_merges_chunks() {
+		let (url, server) = classifier_server(2, |_| 200);
+		let questions = noul_questions(25);
+		let response = classifier_client(url)
+			.system_one(&Value::Null, &questions)
+			.unwrap();
+		let requests = server.join().unwrap();
+		assert_eq!(requests.len(), 2);
+		let mut seen = BTreeMap::new();
+		for request in &requests {
+			assert_eq!(request["items"].as_array().unwrap().len(), 1);
+			assert_eq!(request["tier"], "fast");
+			let dimensions = request["dimensions"].as_object().unwrap();
+			assert!(dimensions.len() <= MAX_DIMENSIONS);
+			for (key, dimension) in dimensions {
+				assert_eq!(dimension["labels"], serde_json::json!(["yes", "no"]));
+				assert!(seen.insert(key.clone(), dimension.clone()).is_none());
+			}
+		}
+		assert_eq!(seen.len(), 25);
+		assert_eq!(response.model, "jev-test");
+		assert_eq!(response.answers.len(), 25);
+		for key in questions.keys() {
+			assert_eq!(response.noul(key), Some(0.9));
+		}
+		// classifier.dev is free: usage stays at zero tokens.
+		assert_eq!(response.usage.input_tokens, 0);
+		assert_eq!(response.usage.output_tokens, 0);
+	}
+
+	#[test]
+	fn classifier_endpoint_maps_choice_to_scores() {
+		let (url, server) = classifier_server(1, |_| 200);
+		let questions: BTreeMap<String, Question> =
+			BTreeMap::from([("where".into(), Question::Choice {
+				instructions: Value::String("Which range?".into()),
+				criteria:     ["r0", "r1", "r2"]
+					.iter()
+					.map(|o| ((*o).to_string(), Value::Null))
+					.collect(),
+			})]);
+		let response = classifier_client(url)
+			.system_one(&Value::Null, &questions)
+			.unwrap();
+		let requests = server.join().unwrap();
+		assert_eq!(
+			requests[0]["dimensions"]["where"]["labels"],
+			serde_json::json!(["r0", "r1", "r2"])
+		);
+		let Some(Answer::Choice { choice, probabilities, confidence }) =
+			response.answers.get("where")
+		else {
+			panic!("expected a choice answer");
+		};
+		assert_eq!(choice, "yes");
+		assert_eq!(probabilities.get("yes"), Some(&0.9));
+		assert_eq!(probabilities.get("r1"), None);
+		assert_eq!(*confidence, 0.9);
+	}
+
+	#[test]
+	fn classifier_fails_over_to_keyed_provider() {
+		let (classifier, c) = classifier_server(1, |_| 502);
+		let (fallback, f) = server(200, 1, "fallback");
+		let mut client = classifier_client(classifier);
+		client.providers.push(Provider {
+			url:  fallback,
+			auth: "Bearer fallback".into(),
+			kind: Endpoint::Typesafe,
+		});
+		let response = client.system_one(&Value::Null, &noul_questions(2)).unwrap();
+		// The keyed mock answers with an empty answer set; the point is that the
+		// chain moved off the failing classifier provider and stuck there.
+		assert_eq!(client.active.load(Ordering::Relaxed), 1);
+		assert_eq!(c.join().unwrap().len(), 1);
+		f.join().unwrap();
+		let _ = response;
+	}
+
+	#[test]
+	fn choice_over_classifier_label_cap_needs_a_keyed_provider() {
+		let questions: BTreeMap<String, Question> =
+			BTreeMap::from([("big".into(), Question::Choice {
+				instructions: Value::String("Pick one".into()),
+				criteria:     (0..=MAX_LABELS)
+					.map(|i| (format!("o{i}"), Value::Null))
+					.collect(),
+			})]);
+		let client = classifier_client("http://127.0.0.1:1".into());
+		assert!(matches!(client.system_one(&Value::Null, &questions), Err(Error::Status(400, _))));
 	}
 }
