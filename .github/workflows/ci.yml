@@ -165,7 +165,10 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: github.event_name == 'push' && needs.checks.outputs.is_release == 'true'
+    # Forks do not fire push events; workflow_dispatch is the reliable trigger.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      needs.checks.outputs.is_release == 'true'
     needs: [checks, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
