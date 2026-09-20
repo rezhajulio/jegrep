@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, classifier-dev-provider]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -25,6 +25,8 @@ jobs:
     timeout-minutes: 20
     outputs:
       version: ${{ steps.metadata.outputs.version }}
+      is_release: ${{ steps.metadata.outputs.is_release }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -44,11 +46,26 @@ jobs:
           package = tomllib.loads(Path("Cargo.toml").read_text())["package"]
           version = package["version"]
           assert package["name"] == "jegrep", "unexpected package name"
-          if os.environ["GITHUB_REF_TYPE"] == "tag":
-              assert os.environ["GITHUB_REF_NAME"] == f"v{version}", "tag must match Cargo.toml version"
+          ref_type = os.environ["GITHUB_REF_TYPE"]
+          ref_name = os.environ["GITHUB_REF_NAME"]
+          if ref_type == "tag":
+              assert ref_name == f"v{version}", "tag must match Cargo.toml version"
+              is_release, release_tag = "true", ref_name
+          elif ref_type == "branch":
+              # Branch pushes on release branches publish a rolling prerelease
+              # tagged with the short SHA, so every build lands in its own
+              # GitHub release.
+              is_release = "true" if ref_name in os.environ["RELEASE_BRANCHES"].split() else "false"
+              release_tag = f"v{version}-{ref_name}-{os.environ['GITHUB_SHA'][:7]}"
+          else:
+              is_release, release_tag = "false", ""
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"version={version}\n")
+              output.write(f"is_release={is_release}\n")
+              output.write(f"release_tag={release_tag}\n")
           PY
+        env:
+          RELEASE_BRANCHES: classifier-dev-provider
       - name: Install repository Rust toolchain
         run: rustup show
       - name: Check formatting
@@ -110,7 +127,7 @@ jobs:
           subprocess.run([binary, "--list-strategies"], check=True)
           PY
       - name: Package release archive
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.checks.outputs.is_release == 'true'
         run: |
           python - <<'PY'
           import os
@@ -138,7 +155,7 @@ jobs:
                       archive.add(path, arcname=f"{stem}/{name}")
           PY
       - name: Upload release archive
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.checks.outputs.is_release == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: jegrep-${{ matrix.target }}
@@ -148,7 +165,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && needs.checks.outputs.is_release == 'true'
     needs: [checks, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -165,7 +182,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.checks.outputs.release_tag }}
+          COMMIT: ${{ github.sha }}
         shell: bash
         run: |
           sha256sum jegrep-* > SHA256SUMS
@@ -173,6 +191,10 @@ jobs:
           if [[ "$TAG" == *-* ]]; then
             options+=(--prerelease)
           fi
-          gh release create "$TAG" --verify-tag --draft --title "jegrep $TAG" \
-            --generate-notes "${options[@]}" jegrep-* SHA256SUMS
+          # Tag pushes point at an existing tag; branch pushes create the
+          # release tag at the pushed commit. A rerun of the same commit
+          # uploads into the existing release instead.
+          gh release create "$TAG" --target "$COMMIT" --draft --title "jegrep $TAG" \
+            --generate-notes "${options[@]}" jegrep-* SHA256SUMS \
+            || gh release upload "$TAG" --clobber jegrep-* SHA256SUMS
           gh release edit "$TAG" --draft=false
