@@ -14,9 +14,11 @@ Natural-language search that works like `grep`. No embeddings, no index, no daem
 - **Semantic:** Finds concepts ("where do we verify JWT tokens?"), not just strings.
 - **No Index:** Searches the live tree on every run. Nothing to build, refresh, or go stale.
 - **Calibrated:** Every path gets an absolute yes/no probability, so thresholds mean something and batches stay comparable.
-- **Precise:** Returns files *and* line ranges, with original line numbers and merged adjacent passages.
-- **Cheap:** Jev bills $0.042 per million input tokens, output free. A typical search over a few thousand files runs **$0.01–0.03**.
-- **Agent-Ready:** `--json` output for scripts and coding agents, plus a benchmark harness for regressions.
+- **Precise:** Returns files *and* line ranges as `dirname/filename:first-last`
+  references, ready to paste into an editor, with original line numbers and
+  merged adjacent passages.
+- **Cheap:** Jev bills $0.042 per million input tokens, output free. A typical search over a few thousand files runs **~$0.005**.
+- **Agent-Ready:** `--json` for scripts and coding agents, `--compact` for a token-lean digest, plus a benchmark harness for regressions.
 
 ## Quick Start
 
@@ -58,11 +60,17 @@ Natural-language search that works like `grep`. No embeddings, no index, no daem
    By default classifier.dev is tried first; when a key exists, OpenRouter or
    TypeSafe answers if classifier.dev fails (auth/credit failures (401/402/403),
    timeouts (408), rate limits (429), server errors (5xx), transport failures,
-   and invalid responses). Pin a provider with `--endpoint classifier`,
-   `--endpoint openrouter`, or `--endpoint typesafe`; a pinned OpenRouter/TypeSafe
-   pair is used exclusively (classifier.dev is dropped from the chain). Other
-   request errors (e.g. 400/422) are returned as-is. classifier.dev is free, so
-   token/cost figures read zero while it serves the requests.
+   and invalid responses). Order them with `--endpoint openrouter` /
+   `--endpoint typesafe`. Other request errors (e.g. 400/422) are returned as-is.
+   classifier.dev is free, so token/cost figures read zero while it serves the
+   requests.
+
+   `--endpoint` is a preference, not a guarantee: the other account can still be
+   billed after a failover. To refuse that, use `--only classifier` /
+   `--only typesafe` / `--only openrouter` / `--only local`: the named provider
+   is used exclusively and a failing request is an error. Every run names its
+   providers in the banner (`jev-latest via classifier → openrouter → typesafe`),
+   and the footer and `--json` `stats.provider` report which one actually served it.
 
 3. **Search**
 
@@ -78,6 +86,55 @@ Natural-language search that works like `grep`. No embeddings, no index, no daem
 ```bash
 jegrep "how is the database connection pooled?" --json | jq .
 ```
+
+`--compact` emits a token-lean digest instead: one row per hit, no color,
+indentation, grouping, or snippets.
+
+```bash
+jegrep "how are request retries counted and reported?" --compact
+```
+
+```
+"how are request retries counted and reported?" → 3 hit(s) · τ 0.20 · round 1
+benches/run.py 0.72 294-385
+src/report.rs 0.73 1-209
+src/jev.rs 0.96 1-458
+# root /home/user/computing/terminal/jegrep · judged 90 · read 20 files · $0.0015 · 1.9s
+```
+
+Each row is tab-separated `path`, `score`, `spans` (so paths with spaces
+split cleanly): `spans` holds up to three `start-end` line ranges, strongest
+first, or `?` when the hit carries no localized range. Rows are ordered like
+the terminal report — weakest first, strongest last — and the `#` trailer
+carries the root the paths are relative to plus what the search touched.
+`--compact` conflicts with `--json` and `--tree`.
+
+## Output
+
+```bash
+jegrep "how are request retries counted and reported?"
+```
+
+```
+ 3 hit(s) for "how are request retries counted and reported?"  · round 1 · τ = 0.20
+
+   src/report.rs  0.70 · whole file · 209 lines
+
+   benches/run.py  0.72 · 92 lines shown
+     benches/run.py:294-385  0.72  …                      failures=errors, query_success=mean("query_success"),
+
+   src/jev.rs  0.97 · 458 lines shown
+     src/jev.rs:1-458  0.97  //! Minimal Jev (`TypeSafe` System One) HTTP client over ureq.
+
+listed 102 · judged 90 · expanded 11 dirs · read 20 files (69.4 KB) · 9 requests · 36.2k tokens · $0.0015 · 2.1s wall / 4.8s api
+```
+
+Every hit row opens with the root-relative `dirname/filename`, and every
+localized passage under it opens with `dirname/filename:first-last`, so one
+selection pastes straight into an editor. A hit shows its top three ranges by
+relevance, strongest last, and hits are ordered weakest first, so the best
+result sits next to your prompt. Directory runs are separated by a
+blank line rather than a directory header, which would only repeat the path.
 
 ## Commands
 
@@ -97,18 +154,27 @@ jegrep "how is the database connection pooled?"
 | `-n`, `--batch <n>` | Soft frontier target per batch | `64` |
 | `--max-batch <n>` | Hard cap of entries per request (≤ 255) | `128` |
 | `-t`, `--thresholds <list>` | Relevance thresholds, one per round | `0.4,0.2` |
-| `--bytes <n>` | Bytes of each file sent for the content check | `32768` |
-| `--ranges <n>` | Heatmap line ranges per file | `16` |
-| `--min-hits <n>` | Stop lowering thresholds once this many hits exist | `1` |
-| `-k`, `--keywords <list>` | Extra grep keywords for grep-prior strategies | derived |
-| `--endpoint <provider>` | `classifier` \| `openrouter` \| `typesafe` (classifier by default) | `classifier` |
+| `--bytes <n>` | Bytes of each file sent for the content check (whole-file strategies¹) | `32768` |
+| `--ranges <n>` | Heatmap line ranges per file (whole-file strategies¹) | `16` |
+| `--min-hits <n>` | Stop lowering thresholds once this many hits exist (whole-file strategies¹) | `1` |
+| `-k`, `--keywords <list>` | Extra keywords for the lexical scan (`cascade`, `window`, `paged-grep*`) | derived |
+| `--endpoint <provider>` | Preferred provider: `classifier` \| `openrouter` \| `typesafe` \| `local`; fails over when keys exist | `classifier` |
+| `--only <provider>` | Exactly this provider: error if its key is absent or a request fails, never fail over | unset |
 | `--model <id>` | Jev model id or alias (ignored by classifier.dev) | `jev-latest` |
 | `--hidden` | Include dot-files and dot-folders | `false` |
+| `--allow-secrets` | Send files whose content looks like credential material instead of withholding them | `false` |
 | `--tree` | Print the annotated exploration tree | `false` |
 | `--json` | JSON output format | `false` |
+| `--compact` | Token-lean digest for LLM readers (see Output) | `false` |
 | `--progress <mode>` | `live` \| `log` (terminal-aware fallback) | `live` |
 | `-v`, `--verbose` | Log every judgment | `false` |
 | `-q`, `--quiet` | Suppress progress on stderr | `false` |
+
+¹ `cascade` (the default) and `window` budget by passage, not by whole-file
+read, and run a single pass: they ignore `--bytes`, `--ranges` and
+`--min-hits` (a warning says so) and use only the last `-t` threshold. Their
+per-passage budgets are the `JEGREP_CASCADE_*` / `JEGREP_WINDOW_*` variables
+below.
 
 **Examples:**
 
@@ -153,26 +219,77 @@ There is no config file. Everything is CLI flags plus environment variables.
 | Variable | Description | Default |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` / `TYPESAFE_API_KEY` | Optional failover provider keys (env or `~/.env`) | unset |
+| `JEGREP_ENDPOINT_URL` | URL used by `--endpoint local` (env or `~/.env`) | `http://127.0.0.1:8756/` |
 | `JEGREP_CASCADE_CANDIDATES` / `FILES` / `WINDOWS` / `BYTES` | Cascade candidate/file/passage/byte budgets | `128` / `20` / `24` / `8192` |
 | `JEGREP_CASCADE_SKETCH_BYTES` / `FULL_LIMIT` / `CUTOFF` | Sketch size, full-passage cap, sketch cutoff | `384` / `40` / `0.45` |
 | `JEGREP_WINDOW_CANDIDATES` / `FILES` / `PER_FILE` / `BYTES` / `PACK` | Window strategy budgets | — |
 | `JEGREP_WINDOW_SCOUT_THRESHOLD` / `JEGREP_WINDOW_ADAPTIVE` / `JEGREP_WINDOW_COMPACT` | Window prefilter tuning | `0.5` / on / on |
 | `JEGREP_QUESTION_CHUNK` | Split Noul batches (opt-in request splitting) | off |
 
+### Local endpoints
+
+`--endpoint local` posts to any HTTP server that speaks the hosted providers'
+request shape, at `JEGREP_ENDPOINT_URL` (default `http://127.0.0.1:8756/`; an
+empty value counts as unset). No API key is read, no `Authorization` header is
+sent, and no hosted failover is added. Failed requests are logged and counted
+in the footer like any other request error; the run still completes with
+whatever was judged.
+
+```jsonc
+// POST <JEGREP_ENDPOINT_URL>
+{ "state": <any JSON>, "model": "jev-latest",
+  "questions": { "q0": { "type": "noul", "instructions": "…" } } }
+// -> 200
+{ "model": "my-local-judge", "answers": { "q0": { "type": "noul", "noul": 0.87 } },
+  "usage": { "input_tokens": 0, "output_tokens": 0 } }
+```
+
+`questions` carry `noul` (yes/no probability) or `choice` (distribution over
+named options, with `criteria`) entries; answers use the same keys and the
+`noul` / `choice` shapes. `usage` may be all zeros for a judge that does not
+bill per token (jegrep prints `$0.0000`). Fit the server's context window
+yourself with the `JEGREP_CASCADE_*` budgets (`-n`/`--max-batch` bound only the
+filename batches; see the option table).
+
+```bash
+JEGREP_ENDPOINT_URL=http://127.0.0.1:8010/v1/systemone jegrep "…" --endpoint local
+```
+
 ### Ignoring Files
 
-jegrep respects `.gitignore` (nested files honored) and skips lockfiles, build
-outputs (`node_modules`, `target`, `dist`, …), and binary extensions. Dot-files
-are excluded unless `--hidden` is passed.
+jegrep respects `.gitignore` (nested files honored, also in directory peeks)
+and skips lockfiles, build outputs (`node_modules`, `target`, `dist`, …), and
+binary extensions. Dot-files are excluded unless `--hidden` is passed.
+
+Credential files are never listed or read, with or without `--hidden`: `.env`
+and `.env.*` (except `.env.example`-style templates), `.netrc`, `.npmrc`,
+`.pypirc`, `.git-credentials`, `credentials.json`, `id_rsa`-style SSH keys, and
+anything ending in `.pem`, `.key`, `.p12`, `.pfx`, `.jks`, `.ppk`, `.kdbx`,
+`.gpg`, `.crt`, `.tfvars` or `.tfstate` (full list: `SECRET_FILES` /
+`SECRET_EXT` in `src/tree.rs`).
+
+Names are only a first line: a Google service-account key downloaded as
+`my-project-4f3a1c.json` or an AWS profile in `deploy/aws_credentials.txt` has
+no listed name. So every file is also checked by *content* before its bytes
+leave the machine (`src/secrets.rs`): PEM private-key blocks, service-account
+JSON, `aws_secret_access_key` / `AKIA…` pairs, kubeconfig `client-key-data`,
+and `ghp_` / `xoxb-` / `sk-` style tokens. Matching files are skipped, named
+in the log (`withheld: private key`), and tallied in the footer and in `--json`
+`stats.secrets_withheld`. The markers are shaped so parsers and docs that
+merely mention a format pass; fixtures with real key material are withheld,
+and `--allow-secrets` sends them anyway. This is still a safety net, not a
+secret scanner — an unfamiliar token pasted into `config.yaml` is ordinary
+text.
 
 ## Troubleshooting
 
 - **Nothing found?** Thresholds lower automatically across rounds and cached
   judgments reopen — but you can also pass an explicit `-t 0.3,0.1`.
 - **Weird results?** Re-run with `--verbose` and `--tree` to see every judgment.
-- **Auth errors?** classifier.dev needs no key. If you pinned a keyed provider
-  (`--endpoint openrouter` / `--endpoint typesafe`), check that key is set
-  (`OPENROUTER_API_KEY` / `TYPESAFE_API_KEY`).
+- **Auth errors?** classifier.dev needs no key. If you set keys (`OPENROUTER_API_KEY` /
+  `TYPESAFE_API_KEY`) or pinned `--only`, check the right key is set.
+- **Billed on the wrong account?** `--endpoint` only orders providers; the
+  footer's `via …` shows who served the run. Use `--only` to forbid failover.
 - **Slow or pricey?** Lower `-n`/`--max-batch`, raise `-t`, or try `-s beam`/`budget`.
 
 ## Building from Source

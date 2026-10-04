@@ -287,13 +287,23 @@ impl Ui {
 		*self.cur_dir.borrow_mut() = None;
 	}
 
-	pub fn banner(&self, query: &str, root: &str, model: &str, p: usize, n: usize, cap: usize) {
+	/// `route` names the providers in the order they are tried.
+	pub fn banner(
+		&self,
+		query: &str,
+		root: &str,
+		model: &str,
+		route: &str,
+		p: usize,
+		n: usize,
+		cap: usize,
+	) {
 		self.line(&format!(
 			"{} {}  {}  {}",
 			self.bold("jegrep"),
 			self.cyan(&format!("\"{query}\"")),
 			self.dim(&format!("in {root}")),
-			self.dim(&format!("· {model} · P={p} N={n} cap={cap}")),
+			self.dim(&format!("· {model} via {route} · P={p} N={n} cap={cap}")),
 		));
 		if self.progress == Progress::Live && !self.is_live() {
 			let live = Arc::new(Live::new(self.color));
@@ -459,6 +469,13 @@ impl Ui {
 		diagnostic(&format!("  {} {}", self.red("!"), what));
 	}
 
+	/// Non-fatal misuse (e.g. a flag the chosen strategy ignores). Shown even
+	/// with `--quiet`.
+	pub fn warn(&self, what: &str) {
+		self.reset_dir();
+		diagnostic(&format!("  {} {}", self.yellow("!"), what));
+	}
+
 	pub fn fatal(&self, what: &str) {
 		self.finish();
 		diagnostic(&format!("{} {}", self.red("error:"), what));
@@ -491,7 +508,14 @@ impl Ui {
 	}
 
 	/// Body lines for localized hits, with the strongest of the top three last.
-	fn hit_body(&self, heat: &[HeatRange], lines_seen: Option<(usize, bool)>) -> Vec<String> {
+	/// Every line opens with a `path:start-end` reference to copy into an
+	/// editor.
+	fn hit_body(
+		&self,
+		rel: &str,
+		heat: &[HeatRange],
+		lines_seen: Option<(usize, bool)>,
+	) -> Vec<String> {
 		let mut body = Vec::new();
 		if heat.is_empty() || Self::whole_file(heat, lines_seen) {
 			return body;
@@ -506,8 +530,8 @@ impl Ui {
 		}
 		for r in sorted.iter().rev().filter(|r| r.p >= 0.05) {
 			body.push(format!(
-				"{:<11} {}  {}",
-				self.cyan(&format!("L{}–{}", r.start, r.end)),
+				"{}  {}  {}",
+				self.cyan(&line_ref(rel, r.start, r.end)),
 				self.p(r.p),
 				fit(&r.snippet, 76)
 			));
@@ -538,7 +562,7 @@ impl Ui {
 		Leaf {
 			rel:    rel.to_owned(),
 			header: format!("  {}{}", self.bold(&self.p(score)), self.dim(&detail)),
-			body:   self.hit_body(heat, lines_seen),
+			body:   self.hit_body(rel, heat, lines_seen),
 		}
 	}
 
@@ -571,23 +595,22 @@ impl Ui {
 		self.print_ranked(out, &leaves);
 	}
 
-	/// Group consecutive directory runs only. A tree regrouping would move a
-	/// high-scoring sibling ahead of lower-scoring files in another directory.
+	/// One row per hit, each opening with the full root-relative path so a row
+	/// can be copied into an editor in one selection. Directory runs stay
+	/// separated by a blank line, and hits stay in global rank order: a
+	/// directory-tree regrouping would move a high-scoring sibling ahead of
+	/// lower-scoring files in another directory.
 	fn print_ranked(&self, out: &mut impl Write, items: &[(f64, Leaf)]) {
 		let mut ordered: Vec<_> = items.iter().collect();
 		ordered.sort_by(|(a, la), (b, lb)| a.total_cmp(b).then(la.rel.cmp(&lb.rel)));
-		let mut current = None;
+		let mut current: Option<&str> = None;
 		for (_, leaf) in ordered {
-			let (dir, name) = split_rel(&leaf.rel);
-			if current != Some(dir) {
-				if current.is_some() {
-					let _ = writeln!(out);
-				}
-				let _ =
-					writeln!(out, " {}", self.bold(&self.blue(if dir.is_empty() { "./" } else { dir })));
-				current = Some(dir);
+			let (dir, _) = split_rel(&leaf.rel);
+			if current.is_some_and(|prev| prev != dir) {
+				let _ = writeln!(out);
 			}
-			let _ = writeln!(out, "   {name}{}", leaf.header);
+			current = Some(dir);
+			let _ = writeln!(out, "   {}{}", self.bold(&leaf.rel), leaf.header);
 			for line in &leaf.body {
 				let _ = writeln!(out, "     {line}");
 			}
@@ -681,6 +704,29 @@ pub fn fit(s: &str, w: usize) -> String {
 	format!("…{tail}")
 }
 
+/// `start-end`, or `start` for a single line.
+pub fn line_span(start: usize, end: usize) -> String {
+	if start == end {
+		start.to_string()
+	} else {
+		format!("{start}-{end}")
+	}
+}
+
+/// `path:start-end` (or `path:start`): one token to copy into an editor or
+/// into a `grep`-shaped tool.
+fn line_ref(rel: &str, start: usize, end: usize) -> String {
+	format!("{rel}:{}", line_span(start, end))
+}
+
+/// The most relevant ranges, strongest first, then earliest.
+pub fn ranked_heat(heat: &[HeatRange], limit: usize) -> Vec<&HeatRange> {
+	let mut sorted: Vec<&HeatRange> = heat.iter().filter(|r| r.p > 0.0).collect();
+	sorted.sort_by(|a, b| b.p.total_cmp(&a.p).then(a.start.cmp(&b.start)));
+	sorted.truncate(limit);
+	sorted
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -705,7 +751,7 @@ mod tests {
 		ui.print_ranked(&mut out, &[(0.97, leaf)]);
 		assert_eq!(
 			String::from_utf8(out).unwrap(),
-			" src/modes/hashline/\n   parser.rs  0.97 · whole file · 854 lines\n"
+			"   src/modes/hashline/parser.rs  0.97 · whole file · 854 lines\n"
 		);
 		let mut verbose = plain_ui();
 		verbose.verbose = true;
@@ -725,10 +771,10 @@ mod tests {
 			(vec![passage(20, 40, 0.97)], Some((854, false))),
 			(vec![passage(1, 854, 0.97)], None),
 		] {
-			let leaf = ui.hit_leaf("parser.rs", 0.97, None, &heat, lines);
+			let leaf = ui.hit_leaf("src/parser.rs", 0.97, None, &heat, lines);
 			assert!(!leaf.header.contains("whole file"));
 			assert_eq!(leaf.body.len(), 1);
-			assert!(leaf.body[0].contains(&format!("L{}–{}", heat[0].start, heat[0].end)));
+			assert!(leaf.body[0].starts_with(&line_ref("src/parser.rs", heat[0].start, heat[0].end)));
 			assert!(!leaf.body[0].contains('█'));
 		}
 	}
@@ -743,14 +789,11 @@ mod tests {
 			("a/low.rs".into(), 0.59),
 			("b/also-middle.rs".into(), 0.75),
 		]);
-		let text = String::from_utf8(out).unwrap();
-		let names: Vec<_> = text
-			.lines()
-			.filter(|l| l.starts_with("   "))
-			.map(|l| l.split_whitespace().next().unwrap())
-			.collect();
-		assert_eq!(names, ["low.rs", "also-middle.rs", "middle.rs", "high.rs"]);
-		assert_eq!(text.matches(" a/\n").count(), 2);
+		assert_eq!(
+			String::from_utf8(out).unwrap(),
+			"   a/low.rs  0.59\n\n   b/also-middle.rs  0.75\n   b/middle.rs  0.75\n\n   a/high.rs  \
+			 0.97\n"
+		);
 	}
 
 	#[test]
@@ -762,10 +805,11 @@ mod tests {
 			passage(21, 30, 0.6),
 			passage(31, 40, 0.9),
 		];
-		let body = ui.hit_body(&heat, Some((50, false)));
+		let body = ui.hit_body("src/parser.rs", &heat, Some((50, false)));
 		assert_eq!(body.len(), 4);
-		assert!(body[1].contains("L21–30"));
-		assert!(body[2].contains("L1–10"));
-		assert!(body[3].contains("L31–40"));
+		assert!(body[1].starts_with("src/parser.rs:21-30"));
+		assert!(body[2].starts_with("src/parser.rs:1-10"));
+		assert!(body[3].starts_with("src/parser.rs:31-40"));
+		assert!(!body.iter().any(|l| l.contains(":11-20")));
 	}
 }

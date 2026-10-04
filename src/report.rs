@@ -3,13 +3,69 @@
 
 use std::io::Write;
 
-use crate::{ctx::Ctx, tree::Kind};
+use crate::{
+	ctx::Ctx,
+	tree::{Kind, Tree},
+	ui,
+};
 
-pub fn print(ctx: &Ctx, json: bool, tree: bool) {
+/// Line ranges a compact hit row carries.
+const COMPACT_RANGES: usize = 3;
+
+/// Digest for LLM readers: one tab-separated `path score spans` row per hit,
+/// no color, grouping, snippets or near misses. `spans` is a comma-separated
+/// list of `start-end` line ranges, strongest first, or `?` when the hit
+/// carries no localized range. Rows keep the terminal report's order: weakest
+/// first, strongest last.
+fn compact_rows(out: &mut impl Write, tree: &Tree, hits: &[usize]) {
+	let mut ordered: Vec<_> = hits.iter().map(|&i| &tree.nodes[i]).collect();
+	ordered.sort_by(|a, b| {
+		let (sa, sb) = (a.content_score.unwrap_or(0.0), b.content_score.unwrap_or(0.0));
+		sa.total_cmp(&sb).then(a.rel.cmp(&b.rel))
+	});
+	for n in ordered {
+		let spans = ui::ranked_heat(&n.heat, COMPACT_RANGES);
+		let spans = if spans.is_empty() {
+			"?".to_string()
+		} else {
+			spans
+				.iter()
+				.map(|r| ui::line_span(r.start, r.end))
+				.collect::<Vec<_>>()
+				.join(",")
+		};
+		let _ = writeln!(out, "{}\t{:.2}\t{spans}", n.rel, n.content_score.unwrap_or(0.0));
+	}
+}
+
+pub fn print(ctx: &Ctx, json: bool, tree: bool, compact: bool) {
 	ctx.ui.finish();
 	let hits = ctx.hits();
 	let elapsed = ctx.started.elapsed();
 	let s = &ctx.stats;
+
+	if compact {
+		let mut out = std::io::stdout().lock();
+		let _ = writeln!(
+			out,
+			"\"{}\" → {} hit(s) · τ {:.2} · round {}",
+			ctx.opts.query,
+			hits.len(),
+			ctx.tau,
+			ctx.rounds
+		);
+		compact_rows(&mut out, &ctx.tree, &hits);
+		let _ = writeln!(
+			out,
+			"# root {} · judged {} · read {} files · ${:.4} · {:.1}s",
+			ctx.tree.root.display(),
+			s.judged,
+			s.files_read,
+			s.usd(),
+			elapsed.as_secs_f64()
+		);
+		return;
+	}
 
 	if json {
 		let hits_json: Vec<serde_json::Value> = hits
@@ -42,6 +98,9 @@ pub fn print(ctx: &Ctx, json: bool, tree: bool) {
 				  "input_tokens": s.input_tokens,
 				  "output_tokens": s.output_tokens,
 				  "retries": crate::jev::RETRIES.load(std::sync::atomic::Ordering::Relaxed),
+				  "provider": ctx.client.active().name(),
+				  "failed_over": ctx.client.failed_over(),
+				  "secrets_withheld": crate::secrets::withheld(),
 				  "waves": s.waves,
 				  "api_ms": s.api_time.as_millis(),
 				  "entries_judged": s.judged,
@@ -142,8 +201,8 @@ pub fn print(ctx: &Ctx, json: bool, tree: bool) {
 		out,
 		"{}",
 		ui.dim(&format!(
-			"listed {listed} · judged {} · expanded {} dirs · read {} files ({}){} · {} requests{}{} \
-			 · {} tokens · ${:.4} · {:.1}s wall / {:.1}s api",
+			"listed {listed} · judged {} · expanded {} dirs · read {} files ({}){}{} · {} \
+			 requests{}{} via {}{} · {} tokens · ${:.4} · {:.1}s wall / {:.1}s api",
 			s.judged,
 			s.expanded,
 			s.files_read,
@@ -152,6 +211,14 @@ pub fn print(ctx: &Ctx, json: bool, tree: bool) {
 				format!(" · sniffed {} heads ({})", s.sniffed, crate::tree::human_size(s.sniff_bytes))
 			} else {
 				String::new()
+			},
+			{
+				let withheld = crate::secrets::withheld();
+				if withheld > 0 {
+					format!(" · withheld {withheld} credential file(s), --allow-secrets to send")
+				} else {
+					String::new()
+				}
 			},
 			s.requests,
 			if s.errors > 0 {
@@ -166,6 +233,12 @@ pub fn print(ctx: &Ctx, json: bool, tree: bool) {
 				} else {
 					String::new()
 				}
+			},
+			ctx.client.active().name(),
+			if ctx.client.failed_over() {
+				" (failed over)"
+			} else {
+				""
 			},
 			human_count(s.input_tokens),
 			s.usd(),
@@ -182,5 +255,65 @@ pub fn human_count(n: u64) -> String {
 		format!("{:.1}k", n as f64 / 1e3)
 	} else {
 		n.to_string()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		fs,
+		time::{SystemTime, UNIX_EPOCH},
+	};
+
+	use super::compact_rows;
+	use crate::tree::{HeatRange, State, Tree};
+
+	fn heat(start: usize, end: usize, p: f64) -> HeatRange {
+		HeatRange { start, end, p, snippet: String::new() }
+	}
+
+	#[test]
+	fn compact_rows_carry_path_score_and_spans_weakest_first() {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		let root = std::env::temp_dir().join(format!("jegrep-compact-{nanos}"));
+		fs::create_dir_all(root.join("core")).unwrap();
+		fs::write(root.join("core/handlers.go"), "package core\n").unwrap();
+		fs::write(root.join("core/requests.go"), "package core\n").unwrap();
+		fs::write(root.join("notes.txt"), "no heat here\n").unwrap();
+		let mut tree = Tree::new(&root, false).unwrap();
+		let core = tree.nodes.iter().position(|n| n.rel == "core/").unwrap();
+		tree.expand(core);
+		let mut hits = Vec::new();
+		for (i, n) in tree.nodes.iter_mut().enumerate() {
+			let (score, ranges) = match n.rel.as_str() {
+				// Spans come out strongest first; single-line spans drop the end.
+				"core/handlers.go" => {
+					(0.72, vec![heat(400, 420, 0.30), heat(120, 180, 0.72), heat(401, 401, 0.60)])
+				},
+				// A whole-file hit is one span, not a `whole file` word.
+				"core/requests.go" => (0.86, vec![heat(1, 546, 0.91)]),
+				// No localized range to report.
+				"notes.txt" => (0.40, Vec::new()),
+				_ => continue,
+			};
+			n.state = State::Hit;
+			n.content_score = Some(score);
+			n.heat = ranges;
+			hits.push(i);
+		}
+		let mut out = Vec::new();
+		compact_rows(&mut out, &tree, &hits);
+		let _ = fs::remove_dir_all(&root);
+		assert_eq!(
+			String::from_utf8(out).unwrap(),
+			concat!(
+				"notes.txt\t0.40\t?\n",
+				"core/handlers.go\t0.72\t120-180,401,400-420\n",
+				"core/requests.go\t0.86\t1-546\n"
+			)
+		);
 	}
 }
